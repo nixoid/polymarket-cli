@@ -55,6 +55,12 @@ struct ApprovalTarget {
     needs_ctf_operator: bool,
 }
 
+struct PendingApproval {
+    label: String,
+    target: Address,
+    calldata: Vec<u8>,
+}
+
 fn approval_targets() -> Result<Vec<ApprovalTarget>> {
     Ok(vec![
         ApprovalTarget {
@@ -96,35 +102,29 @@ fn approval_targets() -> Result<Vec<ApprovalTarget>> {
     ])
 }
 
-pub async fn execute(
-    args: ApproveArgs,
-    output: OutputFormat,
-    private_key: Option<&str>,
-    signature_type: Option<&str>,
-) -> Result<()> {
-    match args.command {
-        ApproveCommand::Check { address } => {
-            check(address, private_key, signature_type, output).await
-        }
-        ApproveCommand::Set => set(private_key, signature_type, output).await,
-    }
+fn collateral_is_approved(allowance: U256) -> bool {
+    allowance > U256::ZERO
 }
 
-async fn check(
+async fn resolve_owner(
     address_arg: Option<Address>,
     private_key: Option<&str>,
     signature_type: Option<&str>,
-    output: OutputFormat,
-) -> Result<()> {
-    let owner: Address = if let Some(addr) = address_arg {
-        addr
-    } else if proxy::is_proxy_mode(signature_type)? {
-        proxy::derive_proxy_address(private_key)?
+) -> Result<Address> {
+    if let Some(addr) = address_arg {
+        return Ok(addr);
+    }
+    if proxy::is_proxy_mode(signature_type)? {
+        proxy::derive_proxy_address(private_key)
     } else {
         let signer = auth::resolve_signer(private_key)?;
-        polymarket_client_sdk_v2::auth::Signer::address(&signer)
-    };
+        Ok(polymarket_client_sdk_v2::auth::Signer::address(&signer))
+    }
+}
 
+async fn fetch_approval_statuses(
+    owner: Address,
+) -> Result<Vec<ApprovalStatus>> {
     let provider = auth::create_readonly_provider().await?;
     let collateral = IERC20::new(super::COLLATERAL_ADDRESS, provider.clone());
     let ctf = IERC1155::new(CONDITIONAL_TOKENS, provider.clone());
@@ -161,6 +161,70 @@ async fn check(
         });
     }
 
+    Ok(statuses)
+}
+
+fn pending_approvals(statuses: &[ApprovalStatus]) -> Result<Vec<PendingApproval>> {
+    let targets = approval_targets()?;
+    let mut pending = Vec::new();
+
+    for (target, status) in targets.iter().zip(statuses.iter()) {
+        if target.needs_collateral_allowance
+            && status.collateral_error.is_none()
+            && !collateral_is_approved(status.collateral_allowance)
+        {
+            pending.push(PendingApproval {
+                label: format!("{COLLATERAL_SYMBOL} \u{2192} {}", target.name),
+                target: super::COLLATERAL_ADDRESS,
+                calldata: IERC20::approveCall {
+                    spender: target.address,
+                    value: U256::MAX,
+                }
+                .abi_encode(),
+            });
+        }
+
+        if target.needs_ctf_operator
+            && status.ctf_error.is_none()
+            && !status.ctf_approved.unwrap_or(false)
+        {
+            pending.push(PendingApproval {
+                label: format!("CTF  \u{2192} {}", target.name),
+                target: CONDITIONAL_TOKENS,
+                calldata: IERC1155::setApprovalForAllCall {
+                    operator: target.address,
+                    approved: true,
+                }
+                .abi_encode(),
+            });
+        }
+    }
+
+    Ok(pending)
+}
+
+pub async fn execute(
+    args: ApproveArgs,
+    output: OutputFormat,
+    private_key: Option<&str>,
+    signature_type: Option<&str>,
+) -> Result<()> {
+    match args.command {
+        ApproveCommand::Check { address } => {
+            check(address, private_key, signature_type, output).await
+        }
+        ApproveCommand::Set => set(private_key, signature_type, output).await,
+    }
+}
+
+async fn check(
+    address_arg: Option<Address>,
+    private_key: Option<&str>,
+    signature_type: Option<&str>,
+    output: OutputFormat,
+) -> Result<()> {
+    let owner = resolve_owner(address_arg, private_key, signature_type).await?;
+    let statuses = fetch_approval_statuses(owner).await?;
     print_approval_status(&statuses, &output)
 }
 
@@ -170,70 +234,62 @@ async fn set(
     output: OutputFormat,
 ) -> Result<()> {
     let use_proxy = proxy::is_proxy_mode(signature_type)?;
-    let targets = approval_targets()?;
-    let total = targets
-        .iter()
-        .map(|target| {
-            usize::from(target.needs_collateral_allowance) + usize::from(target.needs_ctf_operator)
-        })
-        .sum();
+    let owner = resolve_owner(None, private_key, signature_type).await?;
+    let statuses = fetch_approval_statuses(owner).await?;
+    let pending = pending_approvals(&statuses)?;
+
+    if pending.is_empty() {
+        match output {
+            OutputFormat::Table => println!("All contracts already approved. You're ready to trade."),
+            OutputFormat::Json => {
+                println!("{}", serde_json::json!({"status": "already_approved"}));
+            }
+        }
+        return Ok(());
+    }
 
     if matches!(output, OutputFormat::Table) {
         println!("Approving contracts...\n");
     }
 
+    let total = pending.len();
     let mut results: Vec<serde_json::Value> = Vec::new();
-    let mut step = 0;
 
-    for target in &targets {
-        if target.needs_collateral_allowance {
-            step += 1;
-            let label = format!("{COLLATERAL_SYMBOL} \u{2192} {}", target.name);
-            let calldata = IERC20::approveCall {
-                spender: target.address,
-                value: U256::MAX,
-            }
-            .abi_encode();
-            let (tx_hash, _) =
-                proxy::send_call(private_key, use_proxy, super::COLLATERAL_ADDRESS, calldata)
-                    .await
-                    .context(format!(
-                        "Failed {COLLATERAL_SYMBOL} approval for {}",
-                        target.name
-                    ))?;
+    if use_proxy && pending.len() > 1 {
+        let labels: Vec<String> = pending.iter().map(|p| p.label.clone()).collect();
+        let calls: Vec<(Address, Vec<u8>)> = pending
+            .into_iter()
+            .map(|p| (p.target, p.calldata))
+            .collect();
+        let (tx_hash, _, _) = proxy::send_calls(private_key, use_proxy, calls)
+            .await
+            .context("Failed batched proxy approval transaction")?;
 
+        for (step, label) in labels.into_iter().enumerate() {
             match output {
-                OutputFormat::Table => print_tx_result(step, total, &label, tx_hash),
+                OutputFormat::Table => print_tx_result(step + 1, total, &label, tx_hash),
                 OutputFormat::Json => results.push(serde_json::json!({
-                    "step": step,
-                    "type": "erc20",
-                    "asset": COLLATERAL_SYMBOL,
-                    "contract": target.name,
+                    "step": step + 1,
+                    "label": label,
                     "tx_hash": format!("{tx_hash}"),
+                    "batched": true,
                 })),
             }
         }
-
-        if target.needs_ctf_operator {
-            step += 1;
-            let label = format!("CTF  \u{2192} {}", target.name);
-            let calldata = IERC1155::setApprovalForAllCall {
-                operator: target.address,
-                approved: true,
-            }
-            .abi_encode();
+    } else {
+        for (step, action) in pending.into_iter().enumerate() {
             let (tx_hash, _) =
-                proxy::send_call(private_key, use_proxy, CONDITIONAL_TOKENS, calldata)
+                proxy::send_call(private_key, use_proxy, action.target, action.calldata)
                     .await
-                    .context(format!("Failed CTF approval for {}", target.name))?;
+                    .context(format!("Failed approval: {}", action.label))?;
 
             match output {
-                OutputFormat::Table => print_tx_result(step, total, &label, tx_hash),
+                OutputFormat::Table => print_tx_result(step + 1, total, &action.label, tx_hash),
                 OutputFormat::Json => results.push(serde_json::json!({
-                    "step": step,
-                    "type": "erc1155",
-                    "contract": target.name,
+                    "step": step + 1,
+                    "label": action.label,
                     "tx_hash": format!("{tx_hash}"),
+                    "batched": false,
                 })),
             }
         }

@@ -17,13 +17,18 @@ pub(crate) const NEG_RISK_CTF_COLLATERAL_ADAPTER: Address =
     address!("0xAdA200001000ef00D07553cEE7006808F895c6F1");
 
 pub(crate) mod proxy {
+    use std::time::Duration;
+
     use alloy::primitives::U256;
+    use alloy::providers::Provider as _;
     use alloy::sol;
     use anyhow::{Context, Result};
     use polymarket_client_sdk_v2::POLYGON;
     use polymarket_client_sdk_v2::types::{Address, B256};
 
     use crate::auth;
+
+    const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 
     // Polymarket Proxy Wallet Factory interface (CallType: INVALID=0, CALL=1, DELEGATECALL=2).
     sol! {
@@ -55,40 +60,74 @@ pub(crate) mod proxy {
             .ok_or_else(|| anyhow::anyhow!("Proxy wallet derivation not supported on this chain"))
     }
 
+    async fn wait_for_receipt<N: alloy::network::Network>(
+        pending: alloy::providers::PendingTransactionBuilder<N>,
+    ) -> Result<N::ReceiptResponse> {
+        tokio::time::timeout(RECEIPT_TIMEOUT, pending.get_receipt())
+            .await
+            .context("Timed out waiting for transaction receipt (try POLYMARKET_RPC_URL)")?
+            .context("Failed to fetch transaction receipt")
+    }
+
     pub(crate) async fn send_call(
         private_key: Option<&str>,
         use_proxy: bool,
         target: Address,
         calldata: Vec<u8>,
     ) -> Result<(B256, u64)> {
-        use alloy::providers::Provider as _;
+        send_calls(private_key, use_proxy, vec![(target, calldata)])
+            .await
+            .map(|(hash, block, _)| (hash, block))
+    }
+
+    /// Execute one or more contract calls via proxy multicall (proxy mode) or sequential EOA txs.
+    pub(crate) async fn send_calls(
+        private_key: Option<&str>,
+        use_proxy: bool,
+        calls: Vec<(Address, Vec<u8>)>,
+    ) -> Result<(B256, u64, usize)> {
+        if calls.is_empty() {
+            anyhow::bail!("No contract calls to send");
+        }
 
         let provider = auth::create_provider(private_key).await?;
 
-        let (tx_hash, block_number) = if use_proxy {
+        if use_proxy {
             let factory = IProxyWallet::new(PROXY_FACTORY, &provider);
-            let call = IProxyWallet::ProxyCall {
-                typeCode: 1,
-                to: target,
-                value: U256::ZERO,
-                data: calldata.into(),
-            };
-            let pending = factory.proxy(vec![call]).send().await?;
+            let proxy_calls: Vec<IProxyWallet::ProxyCall> = calls
+                .into_iter()
+                .map(|(to, calldata)| IProxyWallet::ProxyCall {
+                    typeCode: 1,
+                    to,
+                    value: U256::ZERO,
+                    data: calldata.into(),
+                })
+                .collect();
+            let call_count = proxy_calls.len();
+            let pending = factory.proxy(proxy_calls).send().await?;
             let hash = *pending.tx_hash();
-            let receipt = pending.get_receipt().await?;
-            (hash, receipt.block_number)
-        } else {
+            let receipt = wait_for_receipt(pending).await?;
+            let block_number = receipt
+                .block_number
+                .context("Block number not available in receipt")?;
+            return Ok((hash, block_number, call_count));
+        }
+
+        let mut last_hash = B256::ZERO;
+        let mut last_block = 0;
+        for (target, calldata) in calls {
             let tx = alloy::rpc::types::TransactionRequest::default()
                 .to(target)
                 .input(alloy::primitives::Bytes::from(calldata).into());
             let pending = provider.send_transaction(tx).await?;
-            let hash = *pending.tx_hash();
-            let receipt = pending.get_receipt().await?;
-            (hash, receipt.block_number)
-        };
+            last_hash = *pending.tx_hash();
+            let receipt = wait_for_receipt(pending).await?;
+            last_block = receipt
+                .block_number
+                .context("Block number not available in receipt")?;
+        }
 
-        let block_number = block_number.context("Block number not available in receipt")?;
-        Ok((tx_hash, block_number))
+        Ok((last_hash, last_block, 1))
     }
 }
 
