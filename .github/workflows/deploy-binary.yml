@@ -1,0 +1,37 @@
+name: Deploy binary
+
+# Publishes a prebuilt linux-arm64 `polymarket` binary as a release asset so the
+# betting-agent deploy can install it directly instead of compiling on the host.
+# Triggered by `deploy-v*` tags (kept separate from the `v*` Release workflow so
+# this does not touch the Homebrew formula on main).
+
+on:
+  push:
+    tags: ["deploy-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package
+        run: tar czf polymarket-linux-arm64.tar.gz -C target/release polymarket
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: polymarket-linux-arm64.tar.gz
