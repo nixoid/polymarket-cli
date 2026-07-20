@@ -29,17 +29,18 @@ struct NonceResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SubmitResponse {
+    // Relayer returns `transactionID` (capital ID), not serde camelCase `transactionId`.
+    #[serde(alias = "transactionID", alias = "transactionId", alias = "transaction_id")]
     transaction_id: String,
     #[allow(dead_code)]
     state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RelayerTx {
     state: Option<String>,
+    #[serde(alias = "transactionHash", alias = "transaction_hash")]
     transaction_hash: Option<String>,
 }
 
@@ -283,10 +284,25 @@ async fn fetch_nonce(client: &reqwest::Client, owner: Address) -> Result<U256> {
     U256::from_str(&body.nonce).context("Invalid nonce value from relayer")
 }
 
+fn tx_hash_if_done(tx: &RelayerTx) -> Option<B256> {
+    let state = tx.state.as_deref().unwrap_or("");
+    if !matches!(
+        state,
+        "STATE_CONFIRMED" | "STATE_MINED" | "STATE_EXECUTED"
+    ) {
+        return None;
+    }
+    let hash = tx.transaction_hash.as_deref()?;
+    if hash.is_empty() || hash == "0x" {
+        return None;
+    }
+    B256::from_str(hash).ok()
+}
+
 async fn submit_wallet_batch(
     client: &reqwest::Client,
     body: &Value,
-) -> Result<SubmitResponse> {
+) -> Result<(SubmitResponse, Option<B256>)> {
     let url = format!("{}/submit", relayer_url());
     let body_str = serde_json::to_string(body).context("Failed to serialize /submit body")?;
     let resp = client
@@ -302,7 +318,15 @@ async fn submit_wallet_batch(
     if !status.is_success() {
         bail!("Relayer POST /submit failed ({status}): {text}");
     }
-    serde_json::from_str(&text).context(format!("Invalid /submit JSON: {text}"))
+    // /submit sometimes returns only {transactionID,state:NEW}; sometimes already EXECUTED+hash.
+    let value: Value =
+        serde_json::from_str(&text).context(format!("Invalid /submit JSON: {text}"))?;
+    let submitted: SubmitResponse = serde_json::from_value(value.clone())
+        .context(format!("Invalid /submit JSON: {text}"))?;
+    let early = parse_relayer_tx(&value)
+        .ok()
+        .and_then(|tx| tx_hash_if_done(&tx));
+    Ok((submitted, early))
 }
 
 async fn poll_confirmed(
@@ -326,30 +350,14 @@ async fn poll_confirmed(
             let value: Value = resp.json().await.context("Invalid /transaction JSON")?;
             let tx = parse_relayer_tx(&value)?;
             let state = tx.state.as_deref().unwrap_or("");
-            match state {
-                "STATE_CONFIRMED" | "STATE_MINED" | "STATE_EXECUTED" => {
-                    if let Some(hash) = tx.transaction_hash.as_deref()
-                        && !hash.is_empty()
-                        && hash != "0x"
-                    {
-                        let hash = B256::from_str(hash)
-                            .context("Invalid transactionHash from relayer")?;
-                        // Prefer confirmed; accept mined/executed once hash is present.
-                        if state == "STATE_CONFIRMED" || state == "STATE_MINED" {
-                            return Ok((hash, 0));
-                        }
-                    }
-                    if state == "STATE_CONFIRMED" {
-                        // Confirmed without hash yet — keep polling briefly.
-                    }
-                }
-                "STATE_FAILED" | "STATE_INVALID" => {
-                    bail!(
-                        "Relayer tx {transaction_id} failed (state={state}, hash={:?})",
-                        tx.transaction_hash
-                    );
-                }
-                _ => {}
+            if matches!(state, "STATE_FAILED" | "STATE_INVALID") {
+                bail!(
+                    "Relayer tx {transaction_id} failed (state={state}, hash={:?})",
+                    tx.transaction_hash
+                );
+            }
+            if let Some(hash) = tx_hash_if_done(&tx) {
+                return Ok((hash, 0));
             }
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -416,8 +424,12 @@ pub async fn send_deposit_wallet_calls(
         }
     });
 
-    let submitted = submit_wallet_batch(&client, &body).await?;
-    let (hash, block) = poll_confirmed(&client, &submitted.transaction_id).await?;
+    let (submitted, early_hash) = submit_wallet_batch(&client, &body).await?;
+    let (hash, block) = if let Some(hash) = early_hash {
+        (hash, 0)
+    } else {
+        poll_confirmed(&client, &submitted.transaction_id).await?
+    };
     Ok((hash, block, calls.len()))
 }
 
@@ -436,5 +448,20 @@ mod tests {
     #[test]
     fn empty_calls_hash_is_keccak_empty() {
         assert_eq!(hash_calls(&[]), keccak256([]));
+    }
+}
+
+#[cfg(test)]
+mod submit_parse_tests {
+    use super::*;
+
+    #[test]
+    fn submit_response_accepts_transaction_id_capital() {
+        let raw = r#"{"transactionID":"019f812c-7dfd-7595-b7c3-19b2abad9e41","transactionHash":"0x19c7ef07fdd5396f221589a955ff1d4f8fa8b009937e38e0a3377b6e2ef3333d","state":"STATE_EXECUTED"}"#;
+        let parsed: SubmitResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.transaction_id, "019f812c-7dfd-7595-b7c3-19b2abad9e41");
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let tx = parse_relayer_tx(&value).unwrap();
+        assert!(tx_hash_if_done(&tx).is_some());
     }
 }
