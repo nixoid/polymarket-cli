@@ -12,8 +12,8 @@ use crate::output::ctf as ctf_output;
 
 use super::proxy;
 use super::{
-    COLLATERAL_ADDRESS_STR, COLLATERAL_DECIMALS, COLLATERAL_SYMBOL, CONDITIONAL_TOKENS,
-    NEG_RISK_ADAPTER,
+    COLLATERAL_ADDRESS, COLLATERAL_ADDRESS_STR, COLLATERAL_DECIMALS, COLLATERAL_SYMBOL,
+    CONDITIONAL_TOKENS, CTF_COLLATERAL_ADAPTER, NEG_RISK_ADAPTER, NEG_RISK_CTF_COLLATERAL_ADAPTER,
 };
 
 sol! {
@@ -314,27 +314,45 @@ pub async fn execute(
             }
             .abi_encode();
 
-            let (tx_hash, block_number) =
-                proxy::send_call(private_key, mode, CONDITIONAL_TOKENS, calldata)
-                    .await
-                    .context("Redeem positions failed")?;
+            // Deposit wallets must redeem via the V2 collateral adapter (not CTF
+            // directly). Adapter ignores collateral/parent/indexSets and burns both
+            // outcomes for the condition, wrapping proceeds to pUSD.
+            let target = match mode {
+                proxy::ExecutionMode::DepositWallet => CTF_COLLATERAL_ADAPTER,
+                _ => CONDITIONAL_TOKENS,
+            };
+            let (tx_hash, block_number) = proxy::send_call(private_key, mode, target, calldata)
+                .await
+                .context("Redeem positions failed")?;
 
             ctf_output::print_tx_result("redeem", tx_hash, block_number, &output)
         }
         CtfCommand::RedeemNegRisk { condition, amounts } => {
-            let amounts = parse_collateral_amounts(&amounts)?;
-
             let mode = proxy::resolve_execution_mode(signature_type)?;
-            let calldata = INegRiskAdapter::redeemPositionsCall {
-                conditionId: condition,
-                amounts,
-            }
-            .abi_encode();
+            let (target, calldata) = if mode == proxy::ExecutionMode::DepositWallet {
+                // V2 neg-risk redeems use the collateral adapter's CTF-shaped
+                // redeemPositions; amounts are derived on-chain from balances.
+                let calldata = IConditionalTokens::redeemPositionsCall {
+                    collateralToken: COLLATERAL_ADDRESS,
+                    parentCollectionId: B256::ZERO,
+                    conditionId: condition,
+                    indexSets: binary_u256_vec(),
+                }
+                .abi_encode();
+                (NEG_RISK_CTF_COLLATERAL_ADAPTER, calldata)
+            } else {
+                let amounts = parse_collateral_amounts(&amounts)?;
+                let calldata = INegRiskAdapter::redeemPositionsCall {
+                    conditionId: condition,
+                    amounts,
+                }
+                .abi_encode();
+                (NEG_RISK_ADAPTER, calldata)
+            };
 
-            let (tx_hash, block_number) =
-                proxy::send_call(private_key, mode, NEG_RISK_ADAPTER, calldata)
-                    .await
-                    .context("Redeem neg-risk positions failed")?;
+            let (tx_hash, block_number) = proxy::send_call(private_key, mode, target, calldata)
+                .await
+                .context("Redeem neg-risk positions failed")?;
 
             ctf_output::print_tx_result("redeem-neg-risk", tx_hash, block_number, &output)
         }

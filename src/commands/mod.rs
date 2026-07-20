@@ -11,10 +11,11 @@ pub(crate) const CTF_EXCHANGE: Address = address!("0xE111180000d2663C0091e4f4002
 pub(crate) const NEG_RISK_CTF_EXCHANGE: Address =
     address!("0xe2222d279d744050d28e00520010520000310F59");
 pub(crate) const NEG_RISK_ADAPTER: Address = address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
+// Official Polygon addresses (docs.polymarket.com/resources/contracts).
 pub(crate) const CTF_COLLATERAL_ADAPTER: Address =
-    address!("0xADa100874d00e3331D00F2007a9c336a65009718");
+    address!("0xAdA100Db00Ca00073811820692005400218FcE1f");
 pub(crate) const NEG_RISK_CTF_COLLATERAL_ADAPTER: Address =
-    address!("0xAdA200001000ef00D07553cEE7006808F895c6F1");
+    address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
 
 pub(crate) mod proxy {
     use std::time::Duration;
