@@ -27,8 +27,23 @@ pub(crate) mod proxy {
     use polymarket_client_sdk_v2::types::{Address, B256};
 
     use crate::auth;
+    use crate::relayer;
 
     const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// How on-chain CTF/approve calls are executed for the active signature type.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ExecutionMode {
+        Eoa,
+        Proxy,
+        DepositWallet,
+    }
+
+    impl ExecutionMode {
+        pub(crate) fn allows_batch(self) -> bool {
+            matches!(self, Self::Proxy | Self::DepositWallet)
+        }
+    }
 
     // Polymarket Proxy Wallet Factory interface (CallType: INVALID=0, CALL=1, DELEGATECALL=2).
     sol! {
@@ -49,8 +64,15 @@ pub(crate) mod proxy {
     const PROXY_FACTORY: Address =
         polymarket_client_sdk_v2::types::address!("0xaB45c5A4B0c941a2F231C04C3f49182e1A254052");
 
-    pub(crate) fn is_proxy_mode(signature_type: Option<&str>) -> Result<bool> {
-        Ok(crate::config::resolve_signature_type(signature_type)? == "proxy")
+    pub(crate) fn resolve_execution_mode(signature_type: Option<&str>) -> Result<ExecutionMode> {
+        match crate::config::resolve_signature_type(signature_type)?.as_str() {
+            "proxy" => Ok(ExecutionMode::Proxy),
+            "poly1271" | "deposit" => Ok(ExecutionMode::DepositWallet),
+            "gnosis-safe" => anyhow::bail!(
+                "gnosis-safe on-chain CTF/approve is not implemented; use poly1271 or proxy"
+            ),
+            _ => Ok(ExecutionMode::Eoa),
+        }
     }
 
     pub(crate) fn derive_proxy_address(private_key: Option<&str>) -> Result<Address> {
@@ -58,6 +80,15 @@ pub(crate) mod proxy {
         let eoa = polymarket_client_sdk_v2::auth::Signer::address(&signer);
         polymarket_client_sdk_v2::derive_proxy_wallet(eoa, POLYGON)
             .ok_or_else(|| anyhow::anyhow!("Proxy wallet derivation not supported on this chain"))
+    }
+
+    pub(crate) fn deposit_wallet_address() -> Result<Address> {
+        let raw = std::env::var("POLYMARKET_FUNDER").context(
+            "POLYMARKET_FUNDER required for poly1271 (deposit wallet address)",
+        )?;
+        raw.trim()
+            .parse()
+            .context("Invalid POLYMARKET_FUNDER address")
     }
 
     async fn wait_for_receipt<N: alloy::network::Network>(
@@ -71,63 +102,68 @@ pub(crate) mod proxy {
 
     pub(crate) async fn send_call(
         private_key: Option<&str>,
-        use_proxy: bool,
+        mode: ExecutionMode,
         target: Address,
         calldata: Vec<u8>,
     ) -> Result<(B256, u64)> {
-        send_calls(private_key, use_proxy, vec![(target, calldata)])
+        send_calls(private_key, mode, vec![(target, calldata)])
             .await
             .map(|(hash, block, _)| (hash, block))
     }
 
-    /// Execute one or more contract calls via proxy multicall (proxy mode) or sequential EOA txs.
+    /// Execute contract calls via deposit-wallet relayer, proxy multicall, or EOA txs.
     pub(crate) async fn send_calls(
         private_key: Option<&str>,
-        use_proxy: bool,
+        mode: ExecutionMode,
         calls: Vec<(Address, Vec<u8>)>,
     ) -> Result<(B256, u64, usize)> {
         if calls.is_empty() {
             anyhow::bail!("No contract calls to send");
         }
 
-        let provider = auth::create_provider(private_key).await?;
-
-        if use_proxy {
-            let factory = IProxyWallet::new(PROXY_FACTORY, &provider);
-            let proxy_calls: Vec<IProxyWallet::ProxyCall> = calls
-                .into_iter()
-                .map(|(to, calldata)| IProxyWallet::ProxyCall {
-                    typeCode: 1,
-                    to,
-                    value: U256::ZERO,
-                    data: calldata.into(),
-                })
-                .collect();
-            let call_count = proxy_calls.len();
-            let pending = factory.proxy(proxy_calls).send().await?;
-            let hash = *pending.tx_hash();
-            let receipt = wait_for_receipt(pending).await?;
-            let block_number = receipt
-                .block_number
-                .context("Block number not available in receipt")?;
-            return Ok((hash, block_number, call_count));
+        match mode {
+            ExecutionMode::DepositWallet => {
+                relayer::send_deposit_wallet_calls(private_key, calls).await
+            }
+            ExecutionMode::Proxy => {
+                let provider = auth::create_provider(private_key).await?;
+                let factory = IProxyWallet::new(PROXY_FACTORY, &provider);
+                let proxy_calls: Vec<IProxyWallet::ProxyCall> = calls
+                    .into_iter()
+                    .map(|(to, calldata)| IProxyWallet::ProxyCall {
+                        typeCode: 1,
+                        to,
+                        value: U256::ZERO,
+                        data: calldata.into(),
+                    })
+                    .collect();
+                let call_count = proxy_calls.len();
+                let pending = factory.proxy(proxy_calls).send().await?;
+                let hash = *pending.tx_hash();
+                let receipt = wait_for_receipt(pending).await?;
+                let block_number = receipt
+                    .block_number
+                    .context("Block number not available in receipt")?;
+                Ok((hash, block_number, call_count))
+            }
+            ExecutionMode::Eoa => {
+                let provider = auth::create_provider(private_key).await?;
+                let mut last_hash = B256::ZERO;
+                let mut last_block = 0;
+                for (target, calldata) in calls {
+                    let tx = alloy::rpc::types::TransactionRequest::default()
+                        .to(target)
+                        .input(alloy::primitives::Bytes::from(calldata).into());
+                    let pending = provider.send_transaction(tx).await?;
+                    last_hash = *pending.tx_hash();
+                    let receipt = wait_for_receipt(pending).await?;
+                    last_block = receipt
+                        .block_number
+                        .context("Block number not available in receipt")?;
+                }
+                Ok((last_hash, last_block, 1))
+            }
         }
-
-        let mut last_hash = B256::ZERO;
-        let mut last_block = 0;
-        for (target, calldata) in calls {
-            let tx = alloy::rpc::types::TransactionRequest::default()
-                .to(target)
-                .input(alloy::primitives::Bytes::from(calldata).into());
-            let pending = provider.send_transaction(tx).await?;
-            last_hash = *pending.tx_hash();
-            let receipt = wait_for_receipt(pending).await?;
-            last_block = receipt
-                .block_number
-                .context("Block number not available in receipt")?;
-        }
-
-        Ok((last_hash, last_block, 1))
     }
 }
 

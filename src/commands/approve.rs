@@ -114,11 +114,13 @@ async fn resolve_owner(
     if let Some(addr) = address_arg {
         return Ok(addr);
     }
-    if proxy::is_proxy_mode(signature_type)? {
-        proxy::derive_proxy_address(private_key)
-    } else {
-        let signer = auth::resolve_signer(private_key)?;
-        Ok(polymarket_client_sdk_v2::auth::Signer::address(&signer))
+    match proxy::resolve_execution_mode(signature_type)? {
+        proxy::ExecutionMode::Proxy => proxy::derive_proxy_address(private_key),
+        proxy::ExecutionMode::DepositWallet => proxy::deposit_wallet_address(),
+        proxy::ExecutionMode::Eoa => {
+            let signer = auth::resolve_signer(private_key)?;
+            Ok(polymarket_client_sdk_v2::auth::Signer::address(&signer))
+        }
     }
 }
 
@@ -233,7 +235,7 @@ async fn set(
     signature_type: Option<&str>,
     output: OutputFormat,
 ) -> Result<()> {
-    let use_proxy = proxy::is_proxy_mode(signature_type)?;
+    let mode = proxy::resolve_execution_mode(signature_type)?;
     let owner = resolve_owner(None, private_key, signature_type).await?;
     let statuses = fetch_approval_statuses(owner).await?;
     let pending = pending_approvals(&statuses)?;
@@ -255,15 +257,15 @@ async fn set(
     let total = pending.len();
     let mut results: Vec<serde_json::Value> = Vec::new();
 
-    if use_proxy && pending.len() > 1 {
+    if mode.allows_batch() && pending.len() > 1 {
         let labels: Vec<String> = pending.iter().map(|p| p.label.clone()).collect();
         let calls: Vec<(Address, Vec<u8>)> = pending
             .into_iter()
             .map(|p| (p.target, p.calldata))
             .collect();
-        let (tx_hash, _, _) = proxy::send_calls(private_key, use_proxy, calls)
+        let (tx_hash, _, _) = proxy::send_calls(private_key, mode, calls)
             .await
-            .context("Failed batched proxy approval transaction")?;
+            .context("Failed batched approval transaction")?;
 
         for (step, label) in labels.into_iter().enumerate() {
             match output {
@@ -279,7 +281,7 @@ async fn set(
     } else {
         for (step, action) in pending.into_iter().enumerate() {
             let (tx_hash, _) =
-                proxy::send_call(private_key, use_proxy, action.target, action.calldata)
+                proxy::send_call(private_key, mode, action.target, action.calldata)
                     .await
                     .context(format!("Failed approval: {}", action.label))?;
 

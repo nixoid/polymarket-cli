@@ -2,6 +2,7 @@ mod auth;
 mod commands;
 mod config;
 mod output;
+mod relayer;
 mod shell;
 
 use std::process::ExitCode;
@@ -23,7 +24,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     private_key: Option<String>,
 
-    /// Signature type: eoa, proxy, or gnosis-safe
+    /// Signature type: eoa, proxy, poly1271 (deposit), or gnosis-safe
     #[arg(long, global = true)]
     signature_type: Option<String>,
 }

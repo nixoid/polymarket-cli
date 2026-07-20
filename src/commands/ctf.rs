@@ -245,7 +245,7 @@ pub async fn execute(
                 None => binary_u256_vec(),
             };
 
-            let use_proxy = proxy::is_proxy_mode(signature_type)?;
+            let mode = proxy::resolve_execution_mode(signature_type)?;
             let calldata = IConditionalTokens::splitPositionCall {
                 collateralToken: collateral,
                 parentCollectionId: parent,
@@ -256,7 +256,7 @@ pub async fn execute(
             .abi_encode();
 
             let (tx_hash, block_number) =
-                proxy::send_call(private_key, use_proxy, CONDITIONAL_TOKENS, calldata)
+                proxy::send_call(private_key, mode, CONDITIONAL_TOKENS, calldata)
                     .await
                     .context("Split position failed")?;
 
@@ -276,7 +276,7 @@ pub async fn execute(
                 None => binary_u256_vec(),
             };
 
-            let use_proxy = proxy::is_proxy_mode(signature_type)?;
+            let mode = proxy::resolve_execution_mode(signature_type)?;
             let calldata = IConditionalTokens::mergePositionsCall {
                 collateralToken: collateral,
                 parentCollectionId: parent,
@@ -287,7 +287,7 @@ pub async fn execute(
             .abi_encode();
 
             let (tx_hash, block_number) =
-                proxy::send_call(private_key, use_proxy, CONDITIONAL_TOKENS, calldata)
+                proxy::send_call(private_key, mode, CONDITIONAL_TOKENS, calldata)
                     .await
                     .context("Merge positions failed")?;
 
@@ -305,7 +305,7 @@ pub async fn execute(
                 None => binary_u256_vec(),
             };
 
-            let use_proxy = proxy::is_proxy_mode(signature_type)?;
+            let mode = proxy::resolve_execution_mode(signature_type)?;
             let calldata = IConditionalTokens::redeemPositionsCall {
                 collateralToken: collateral,
                 parentCollectionId: parent,
@@ -315,7 +315,7 @@ pub async fn execute(
             .abi_encode();
 
             let (tx_hash, block_number) =
-                proxy::send_call(private_key, use_proxy, CONDITIONAL_TOKENS, calldata)
+                proxy::send_call(private_key, mode, CONDITIONAL_TOKENS, calldata)
                     .await
                     .context("Redeem positions failed")?;
 
@@ -324,7 +324,7 @@ pub async fn execute(
         CtfCommand::RedeemNegRisk { condition, amounts } => {
             let amounts = parse_collateral_amounts(&amounts)?;
 
-            let use_proxy = proxy::is_proxy_mode(signature_type)?;
+            let mode = proxy::resolve_execution_mode(signature_type)?;
             let calldata = INegRiskAdapter::redeemPositionsCall {
                 conditionId: condition,
                 amounts,
@@ -332,7 +332,7 @@ pub async fn execute(
             .abi_encode();
 
             let (tx_hash, block_number) =
-                proxy::send_call(private_key, use_proxy, NEG_RISK_ADAPTER, calldata)
+                proxy::send_call(private_key, mode, NEG_RISK_ADAPTER, calldata)
                     .await
                     .context("Redeem neg-risk positions failed")?;
 
