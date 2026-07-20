@@ -51,20 +51,16 @@ fn relayer_url() -> String {
         .to_string()
 }
 
-fn relayer_api_key() -> Result<String> {
-    std::env::var("RELAYER_API_KEY")
-        .or_else(|_| std::env::var("POLYMARKET_RELAYER_API_KEY"))
-        .context(
-            "RELAYER_API_KEY (or POLYMARKET_RELAYER_API_KEY) required for poly1271 on-chain calls",
-        )
-}
-
-fn relayer_api_key_address() -> Result<String> {
-    std::env::var("RELAYER_API_KEY_ADDRESS")
-        .or_else(|_| std::env::var("POLYMARKET_RELAYER_API_KEY_ADDRESS"))
-        .context(
-            "RELAYER_API_KEY_ADDRESS (or POLYMARKET_RELAYER_API_KEY_ADDRESS) required for poly1271 on-chain calls",
-        )
+fn env_nonempty(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 fn deposit_wallet() -> Result<Address> {
@@ -82,25 +78,106 @@ fn http_client() -> Result<reqwest::Client> {
         .context("Failed to build relayer HTTP client")
 }
 
-fn auth_headers() -> Result<reqwest::header::HeaderMap> {
+/// Builder HMAC (url-safe base64, keep `=`), matching `@polymarket/builder-signing-sdk`.
+fn builder_hmac_signature(
+    secret_b64: &str,
+    timestamp: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let secret = STANDARD
+        .decode(secret_b64.trim())
+        .or_else(|_| URL_SAFE.decode(secret_b64.trim()))
+        .context("Invalid POLY_BUILDER_SECRET (expected base64)")?;
+    let mut message = format!("{timestamp}{method}{path}");
+    if let Some(body) = body {
+        message.push_str(body);
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret).context("Invalid HMAC key")?;
+    mac.update(message.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    // url-safe base64 but keep '=' padding
+    Ok(STANDARD
+        .encode(digest)
+        .replace('+', "-")
+        .replace('/', "_"))
+}
+
+fn auth_headers(method: &str, path: &str, body: Option<&str>) -> Result<reqwest::header::HeaderMap> {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "RELAYER_API_KEY",
-        relayer_api_key()?
-            .parse()
-            .context("Invalid RELAYER_API_KEY header value")?,
-    );
-    headers.insert(
-        "RELAYER_API_KEY_ADDRESS",
-        relayer_api_key_address()?
-            .parse()
-            .context("Invalid RELAYER_API_KEY_ADDRESS header value")?,
-    );
     headers.insert(
         reqwest::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),
     );
-    Ok(headers)
+
+    // Prefer Relayer API keys (Settings → Relayer API keys).
+    if let (Some(key), Some(address)) = (
+        env_nonempty(&["RELAYER_API_KEY", "POLYMARKET_RELAYER_API_KEY"]),
+        env_nonempty(&[
+            "RELAYER_API_KEY_ADDRESS",
+            "POLYMARKET_RELAYER_API_KEY_ADDRESS",
+        ]),
+    ) {
+        headers.insert(
+            "RELAYER_API_KEY",
+            key.parse().context("Invalid RELAYER_API_KEY header value")?,
+        );
+        headers.insert(
+            "RELAYER_API_KEY_ADDRESS",
+            address
+                .parse()
+                .context("Invalid RELAYER_API_KEY_ADDRESS header value")?,
+        );
+        return Ok(headers);
+    }
+
+    // Fallback: Builder API keys also authenticate relayer /submit (Polymarket docs).
+    let key = env_nonempty(&["POLY_BUILDER_API_KEY", "BUILDER_API_KEY"]);
+    let secret = env_nonempty(&["POLY_BUILDER_SECRET", "BUILDER_SECRET"]);
+    let passphrase = env_nonempty(&["POLY_BUILDER_PASSPHRASE", "BUILDER_PASSPHRASE"]);
+    if let (Some(key), Some(secret), Some(passphrase)) = (key, secret, passphrase) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock before epoch")?
+            .as_secs()
+            .to_string();
+        let signature = builder_hmac_signature(&secret, &timestamp, method, path, body)?;
+        headers.insert(
+            "POLY_BUILDER_API_KEY",
+            key.parse()
+                .context("Invalid POLY_BUILDER_API_KEY header value")?,
+        );
+        headers.insert(
+            "POLY_BUILDER_PASSPHRASE",
+            passphrase
+                .parse()
+                .context("Invalid POLY_BUILDER_PASSPHRASE header value")?,
+        );
+        headers.insert(
+            "POLY_BUILDER_TIMESTAMP",
+            timestamp
+                .parse()
+                .context("Invalid POLY_BUILDER_TIMESTAMP header value")?,
+        );
+        headers.insert(
+            "POLY_BUILDER_SIGNATURE",
+            signature
+                .parse()
+                .context("Invalid POLY_BUILDER_SIGNATURE header value")?,
+        );
+        return Ok(headers);
+    }
+
+    bail!(
+        "poly1271 on-chain calls require either RELAYER_API_KEY + RELAYER_API_KEY_ADDRESS \
+         or POLY_BUILDER_API_KEY + POLY_BUILDER_SECRET + POLY_BUILDER_PASSPHRASE"
+    );
 }
 
 fn encode_address_word(addr: Address) -> [u8; 32] {
@@ -193,9 +270,10 @@ async fn fetch_nonce(client: &reqwest::Client, owner: Address) -> Result<U256> {
         relayer_url(),
         owner
     );
+    let path = format!("/nonce?address={:?}&type=WALLET", owner);
     let resp = client
         .get(&url)
-        .headers(auth_headers()?)
+        .headers(auth_headers("GET", &path, None)?)
         .send()
         .await
         .context("Relayer GET /nonce failed")?
@@ -210,10 +288,12 @@ async fn submit_wallet_batch(
     body: &Value,
 ) -> Result<SubmitResponse> {
     let url = format!("{}/submit", relayer_url());
+    let body_str = serde_json::to_string(body).context("Failed to serialize /submit body")?;
     let resp = client
         .post(&url)
-        .headers(auth_headers()?)
-        .json(body)
+        .headers(auth_headers("POST", "/submit", Some(&body_str))?)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body_str)
         .send()
         .await
         .context("Relayer POST /submit failed")?;
@@ -229,7 +309,8 @@ async fn poll_confirmed(
     client: &reqwest::Client,
     transaction_id: &str,
 ) -> Result<(B256, u64)> {
-    let url = format!("{}/transaction?id={transaction_id}", relayer_url());
+    let path = format!("/transaction?id={transaction_id}");
+    let url = format!("{}{path}", relayer_url());
     let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -237,7 +318,7 @@ async fn poll_confirmed(
         }
         let resp = client
             .get(&url)
-            .headers(auth_headers()?)
+            .headers(auth_headers("GET", &path, None)?)
             .send()
             .await
             .context("Relayer GET /transaction failed")?;
