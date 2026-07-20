@@ -19,7 +19,9 @@ const DEFAULT_RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
 const DEPOSIT_WALLET_FACTORY: &str = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07";
 const DOMAIN_NAME: &str = "DepositWallet";
 const DOMAIN_VERSION: &str = "1";
-const DEADLINE_SECS: u64 = 240;
+// Relayer max window is 300s; shorter values intermittently fail with
+// `deadline too soon` (MetaMask uses the max for the same reason).
+const DEADLINE_SECS: u64 = 300;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_TIMEOUT: Duration = Duration::from_secs(120);
 
